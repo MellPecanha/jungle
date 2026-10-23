@@ -1,0 +1,37 @@
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: jungle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jungle_wagering
+      POSTGRES_USER: jungle
+      POSTGRES_PASSWORD: jungle_dev
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jungle -d jungle_wagering"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:4.8
+    container_name: jungle-localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      LS_LOG: warn
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./docker/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh
+
+volumes:
+  postgres_data:
+  localstack_data:
