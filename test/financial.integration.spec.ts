@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import { ConflictException } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { randomUUID } from 'node:crypto';
 import config from '../src/infrastructure/database/mikro-orm.config.js';
@@ -64,6 +65,36 @@ integration('financial integration (PostgreSQL)', () => {
     const entries = await orm.em.fork().execute<{ debits: string; balance: string }[]>(`select count(*) filter (where direction = 'DEBIT') as debits, sum(case when direction = 'CREDIT' then amount else -amount end) as balance from wallet_ledger_entries where wallet_id = ?`, [wallet.id]);
     expect(Number(entries[0]?.debits)).toBe(2);
     expect(entries[0]?.balance).toBe('80.00');
+    await expectReconciled(wallet.id);
+  });
+
+  it('reports divergent idempotency payloads as conflicts before looking up the supplied wallet', async () => {
+    const playerId = randomUUID();
+    const wallet = await new OpenWalletService(orm.em.fork()).execute({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input: ProcessWagerInput = { providerId: randomUUID(), externalTransactionId: randomUUID(), idempotencyKey: randomUUID(), playerId,
+      walletId: wallet.id, roundId: randomUUID(), gameId: 'game', kind: WagerTransactionKind.Bet, money: { amount: '10.00', currency: 'BRL' } };
+    const service = new ProcessWagerTransactionService(orm.em.fork());
+    await service.execute(input);
+    try {
+      await service.execute({ ...input, walletId: randomUUID() });
+      throw new Error('Expected divergent idempotency payload to fail');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConflictException);
+    }
+  });
+
+  it('persists an auditable FAILED transaction for a permanent technical failure', async () => {
+    const playerId = randomUUID();
+    const wallet = await new OpenWalletService(orm.em.fork()).execute({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+    const input: ProcessWagerInput = { providerId: randomUUID(), externalTransactionId: randomUUID(), idempotencyKey: randomUUID(), playerId,
+      walletId: wallet.id, roundId: randomUUID(), gameId: 'game', kind: WagerTransactionKind.Bet, money: { amount: '10.00', currency: 'BRL' } };
+    const service = new ProcessWagerTransactionService(orm.em.fork());
+    await service.recordPermanentFailure(input);
+    const rows = await orm.em.fork().execute<{ status: string; failure_code: string; result_balance: string }[]>(
+      `select status, failure_code, result_balance from wager_transactions where idempotency_key = ?`, [input.idempotencyKey],
+    );
+    expect(rows).toEqual([{ status: 'FAILED', failure_code: 'INTERNAL_ERROR', result_balance: '100.00' }]);
+    expect(await service.execute(input)).toMatchObject({ status: 'FAILED', idempotentReplay: true });
     await expectReconciled(wallet.id);
   });
 

@@ -76,6 +76,12 @@ export class ProcessWagerTransactionService {
     try {
       const context = { correlationId: input.correlationId ?? transaction.id, causationId: input.causationId };
       return await manager.transactional(async (tx) => {
+        if (!pendingId) {
+          const existingByKey = await this.findByIdempotency(tx, input.idempotencyKey);
+          if (existingByKey) {
+            return this.replayOrConflict(existingByKey, input, payloadHash);
+          }
+        }
         const wallet = await this.findWalletForUpdate(tx, input.walletId);
         if (!wallet) throw new NotFoundException('Wallet not found');
         if (pendingId) {
@@ -108,11 +114,7 @@ export class ProcessWagerTransactionService {
           if (!existing) {
             throw new ConflictException('Transaction identity conflicts with an existing operation');
           }
-          if (existing.payload_hash !== payloadHash && existing.payload_hash !== this.legacyHashPayload(input)) {
-            throw new ConflictException('Idempotency key was reused with a different payload');
-          }
-          this.metrics?.increment('idempotentReplays');
-          return this.toResult(existing, true);
+          return this.replayOrConflict(existing, input, payloadHash);
         }
 
         if (wallet.player_id !== input.playerId || wallet.currency !== money.currency) {
@@ -259,6 +261,40 @@ export class ProcessWagerTransactionService {
     }
   }
 
+  /**
+   * Best-effort audit trail for a technical failure which is known to be
+   * permanent (for example an incompatible database schema). Transient
+   * failures must never use this path because they remain eligible for retry.
+   */
+  async recordPermanentFailure(input: ProcessWagerInput, manager: EntityManager = this.em): Promise<void> {
+    let money: Money;
+    try { money = Money.from(input.money); } catch { return; }
+    if (money.isZero()) return;
+    await manager.transactional(async (tx) => {
+      if (await this.findByIdempotency(tx, input.idempotencyKey)) return;
+      const wallet = await this.findWalletForUpdate(tx, input.walletId);
+      if (!wallet || wallet.player_id !== input.playerId || wallet.currency !== money.currency) return;
+      const payloadHash = this.hashPayload(input);
+      await tx.execute(
+        `insert into wager_transactions
+          (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+           wallet_id, player_id, round_id, game_id, kind, amount, currency,
+           reference_external_transaction_id, correlation_id, causation_id,
+           status, failure_code, processed_at, result_balance)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FAILED', ?, now(), ?)
+         on conflict do nothing`,
+        [
+          randomUUID(), input.providerId, input.externalTransactionId, input.idempotencyKey,
+          payloadHash, input.walletId, input.playerId, input.roundId, input.gameId,
+          input.kind, money.toJSON().amount, money.currency,
+          input.referenceExternalTransactionId ?? null, input.correlationId ?? null,
+          input.causationId ?? null, FailureCode.InternalError, String(wallet.balance),
+        ],
+        'run',
+      );
+    });
+  }
+
   private hashPayload(input: ProcessWagerInput): string {
     const canonical = JSON.stringify({
       externalTransactionId: input.externalTransactionId,
@@ -296,6 +332,14 @@ export class ProcessWagerTransactionService {
       [key],
     );
     return rows[0];
+  }
+
+  private replayOrConflict(existing: Record<string, unknown>, input: ProcessWagerInput, payloadHash: string): ProcessWagerResult {
+    if (existing.payload_hash !== payloadHash && existing.payload_hash !== this.legacyHashPayload(input)) {
+      throw new ConflictException('Idempotency key was reused with a different payload');
+    }
+    this.metrics?.increment('idempotentReplays');
+    return this.toResult(existing, true);
   }
 
   private async findReference(tx: EntityManager, providerId: string, externalId?: string) {

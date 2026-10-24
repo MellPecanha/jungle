@@ -81,7 +81,7 @@ integration('messaging integration (PostgreSQL and SQS)', () => {
     const wallet = await new OpenWalletService(em).execute({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
     const messageId = randomUUID();
     const externalTransactionId = randomUUID();
-    const body = JSON.stringify({ messageId, type: 'WagerTransactionRequested', data: {
+    const body = JSON.stringify({ messageId, type: 'WagerTransactionRequested', occurredAt: new Date().toISOString(), data: {
       providerId: randomUUID(), externalTransactionId, idempotencyKey: randomUUID(), playerId, walletId: wallet.id,
       roundId: randomUUID(), gameId: 'game', kind: 'BET', money: { amount: '25.00', currency: 'BRL' },
     } });
@@ -116,6 +116,14 @@ integration('messaging integration (PostgreSQL and SQS)', () => {
     await new WagerConsumerService(new SqsClient(), orm.em.fork(), new ProcessWagerTransactionService(orm.em.fork())).processAvailable();
     const result = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlq, WaitTimeSeconds: 2 }));
     expect(result.Messages?.[0]?.Body).toBe('{bad json');
+  }, 30000);
+
+  it('routes a message without occurredAt to the DLQ', async () => {
+    const body = JSON.stringify({ messageId: randomUUID(), type: 'WagerTransactionRequested', data: {} });
+    await sqs.send(new SendMessageCommand({ QueueUrl: mainQueue, MessageBody: body, MessageGroupId: randomUUID(), MessageDeduplicationId: randomUUID() }));
+    await new WagerConsumerService(new SqsClient(), orm.em.fork(), new ProcessWagerTransactionService(orm.em.fork())).processAvailable();
+    const result = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlq, WaitTimeSeconds: 2 }));
+    expect(result.Messages?.[0]?.Body).toBe(body);
   }, 30000);
 
   it('publishes the same outbox concurrently without losing events', async () => {
@@ -164,7 +172,7 @@ integration('messaging integration (PostgreSQL and SQS)', () => {
     const playerId = randomUUID();
     const wallet = await new OpenWalletService(orm.em.fork()).execute({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
     const messageId = randomUUID();
-    const body = JSON.stringify({ messageId, type: 'WagerTransactionRequested', data: { providerId: randomUUID(), externalTransactionId: randomUUID(), idempotencyKey: randomUUID(), playerId, walletId: wallet.id, roundId: randomUUID(), gameId: 'game', kind: 'BET', money: { amount: '40.00', currency: 'BRL' } } });
+    const body = JSON.stringify({ messageId, type: 'WagerTransactionRequested', occurredAt: new Date().toISOString(), data: { providerId: randomUUID(), externalTransactionId: randomUUID(), idempotencyKey: randomUUID(), playerId, walletId: wallet.id, roundId: randomUUID(), gameId: 'game', kind: 'BET', money: { amount: '40.00', currency: 'BRL' } } });
     await sqs.send(new SendMessageCommand({ QueueUrl: mainQueue, MessageBody: body, MessageGroupId: wallet.id, MessageDeduplicationId: randomUUID() }));
     const worker = Bun.spawn([process.execPath, 'test/helpers/sqs-crash-worker.ts'], { env: { ...process.env, TEST_SCHEMA: schema }, stdout: 'pipe', stderr: 'pipe' });
     expect(await worker.exited).toBe(23);
